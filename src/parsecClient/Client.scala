@@ -8,9 +8,11 @@ import java.awt.GraphicsConfiguration
 import swing._
 import scala.util.parsing.combinator.debugging.AndOrZipper
 import scala.util.parsing.combinator.debugging.Controllers
+import scala.util.parsing.combinator.debugging
 import scala.tools.nsc
-import scala.tools.nsc.reporters.ConsoleReporter
-import scala.tools.nsc.io.{PlainDirectory, Directory, PlainFile}
+import scala.tools.nsc.reporters.{Reporter, ConsoleReporter}
+import scala.reflect.io.{PlainDirectory, Directory, PlainFile}
+import scala.collection.mutable
 
 object Client extends SimpleSwingApplication {
   val c = new Client
@@ -44,32 +46,63 @@ object Client extends SimpleSwingApplication {
 
 class Client extends Controllers {
 
+  class MainListener extends debugging.Listener {
+    def stepIn(id: Int, name: String, location: debugging.ParserLocation, tree: debugging.AndOrZipper): Option[debugging.Notification] =  {
+      val ack = new debugging.Notification
+      lock.synchronized {
+        assert(localController.isEmpty, "local controller has to be empty")
+        println("[listener] adding a step: " + name)
+        zs = tree :: zs
+        localController = Some(ack) // this should be under synchronized
+        ids.push(id)
+        Some(ack) // atm we are interested in every step
+      }
+    }
+    def stepOut(id: Int, last: Boolean): Option[debugging.Notification] = lock.synchronized {
+      if (ids.nonEmpty && ids.head == id) ids.pop() else {
+        if (ids.contains(id)) println("[listener] missed some parser : " + id)
+        else                  println("[listener] exit parser that we never entered: " + id)
+      }
+      if (last && ids.isEmpty) Client.step.enabled = false
+      None // atm we are not interested 
+    }
+  }
+
   val controller = new Controller // this will serve as our way of communicating with the running debugger session
   val req = new Request
   var zs : List[AndOrZipper] = Nil
-  var isDone : Boolean = false
   var index : Int = 0
   val methHandler = null
-  var op : Thread = null 
+  var op : Thread = null
+  var reporter: Reporter = null
+  var listener = new MainListener()
+  var localController: Option[debugging.Notification] = None
+  val lock = new AnyRef()
+  val ids = new mutable.Stack[Int]()
+
+  def isParsecDone = lock.synchronized {
+    ids.isEmpty
+  }
+
   def compile : List[String] = {
 
     def createCompiler(out: String): (nsc.Global, nsc.Settings) = {
       val settings = new nsc.Settings()
       val props = new java.util.Properties()
+      System.setProperty("parser.combinators.debug", "true") // enable macro
+      System.setProperty("parser.debug", "true")             // enable standard debuging info
       props.load(new java.io.FileInputStream("local.properties"))
       val classPath = props.getProperty("scala.home") + "/lib/scala-library.jar"
       settings.classpath.value = classPath //System.getProperty("java.class.path")
-      val jFile = new java.io.File(out)
-      val directory = new Directory(jFile)
-      val compDirectory = new PlainDirectory(directory)
+      val compDirectory = new PlainDirectory(new Directory(new java.io.File(out)))
       settings.outputDirs.setSingleOutput(compDirectory)
-
-      val global = new nsc.Global(settings, new ConsoleReporter(settings))
+      reporter = new ConsoleReporter(settings)
+      val global = new nsc.Global(settings, reporter)
       (global, settings)
     }
 
     def doCompile(filesToCompile : List[String], dest : String) {
-      println("WILL COMPILE: " + filesToCompile.mkString(", "))
+      println("[compiling]: " + filesToCompile.mkString(", "))
       val (comp, settings) = createCompiler(dest)
       val command = new nsc.CompilerCommand(filesToCompile, settings)
       val run = new comp.Run
@@ -106,54 +139,57 @@ class Client extends Controllers {
 
     // Compile files
     val files = compile // Echoed out to save a bit of time
+    if (reporter.hasErrors) {
+      println("Compilation failed")
+    } else {
+      println("Compilation succeeded")
 
-    println("Compile was successful")
+      // Now find the class containing the main function
+      val classToRun = findClass
 
-    // Now find the class containing the main function
-    val classToRun = findClass
+      println("[parsec] run class " + classToRun.getName)
 
-    println("Class name: " + classToRun.getName)
+      // Create a controller
+      controller.request = req
 
-    // Create a controller
-    controller.request = req
+      // Invoke the class we found, calling run with a newly created controller
+      val methHandler = classToRun.getMethod("runMain", classOf[Controller]) // runTest would be defined in Parsers and would add Controller argument to the list of listeners
+      val f           = classToRun.getField("MODULE$")
+      val listenerHandler = classToRun.getMethod("addListener", classOf[debugging.Listener])
 
-    // Invoke the class we found, calling run with a newly created controller
-    val methHandler = classToRun.getMethod("runMain", classOf[Controller]) // runTest would be defined in Parsers and would add Controller argument to the list of listeners
-    val f           = classToRun.getField("MODULE$")
-    f.setAccessible(true)
-    val c           = f.get(null)
-    op              = new Thread() {
-      override def run() {
-        try {
-          methHandler.invoke(c, controller)
-        }
-        catch { case e => e.getCause().printStackTrace(); }
-      } 
+      f.setAccessible(true)
+      val c           = f.get(null)
+      op              = new Thread() {
+        override def run() {
+          try {
+            listenerHandler.invoke(c, listener)
+            methHandler.invoke(c, controller)
+          }
+          catch { case e => e.getCause().printStackTrace(); }
+        } 
+      }
+
+      // Enable clicking next
+      Client.step.enabled = true
+      Client.compile.enabled = false
+
+      op.start()
+      //testLoop(op, controller)
     }
-
-    // Enable clicking next
-    Client.step.enabled_=(true)
-    Client.compile.enabled_=(false)
-
-    op.start()
-    //testLoop(op, controller)
-
   }
 
   def step : AndOrZipper = {
-
     if (index == 0) {
       // If the index is 0, then we need to get the next element
       next
-
       // if this was the last, then disable next
-      if (isDone) Client.step.enabled_=(false)
+      if (isParsecDone) Client.step.enabled_=(false)
     } 
     else {
       index = index - 1
 
       // If we are moving to the end and it's last, disable next
-      if (isDone && index == 0) Client.step.enabled_=(false)
+      if (isParsecDone && index == 0) Client.step.enabled_=(false)
     }
     Client.stepBack.enabled_=(true)
     zs.drop(index).head
@@ -179,7 +215,7 @@ class Client extends Controllers {
 
 
   def next : Unit = {
-    controller.synchronized {
+    /*controller.synchronized {
       controller.notify
     }
     if (op.getState != java.lang.Thread.State.TERMINATED) {
@@ -190,6 +226,17 @@ class Client extends Controllers {
         isDone = controller.request.isDone
         controller.request.field = null
       }
+    }*/
+
+    lock.synchronized {
+      while (localController.isEmpty) lock.wait()
+      // zs was filled
+      val ack = localController.get
+      ack.synchronized {
+        ack.setReady()
+        ack.notify()
+      }
+      localController = None
     }
   }
 
